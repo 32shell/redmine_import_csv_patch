@@ -1,0 +1,557 @@
+From 0602e69bdd614d872dabd6858fb6ec18b22e4089 Mon Sep 17 00:00:00 2001
+From: Gregor Schmidt <schmidt@nach-vorne.eu>
+Date: Fri, 16 Feb 2018 10:54:54 +0100
+Subject: [PATCH 2/2] Support issue relations when importing issues
+
+---
+ app/models/import.rb                               |   8 +-
+ app/models/issue_import.rb                         | 128 ++++++++++++++++++++
+ app/views/imports/_fields_mapping.html.erb         |  28 +----
+ app/views/imports/_relations_mapping.html.erb      |  60 ++++++++++
+ app/views/imports/mapping.html.erb                 |   7 ++
+ config/locales/de.yml                              |   1 +
+ config/locales/en.yml                              |   1 +
+ test/fixtures/files/import_subtasks.csv            |  10 +-
+ .../files/import_subtasks_with_relations.csv       |   5 +
+ .../files/import_subtasks_with_unique_id.csv       |  15 ++-
+ test/unit/issue_import_test.rb                     | 131 ++++++++++++++++++++-
+ 11 files changed, 356 insertions(+), 38 deletions(-)
+ create mode 100644 app/views/imports/_relations_mapping.html.erb
+ create mode 100644 test/fixtures/files/import_subtasks_with_relations.csv
+
+diff --git app/models/import.rb b/app/models/import.rb
+index 50d154304..328bb7476 100644
+--- app/models/import.rb
++++ b/app/models/import.rb
+@@ -187,6 +187,7 @@ class Import < ActiveRecord::Base
+         item.save!
+         imported += 1
+ 
++        extend_object(row, item, object) if object.persisted?
+         do_callbacks(use_unique_id? ? item.unique_id : item.position, object)
+       end
+       current = position
+@@ -244,7 +245,12 @@ class Import < ActiveRecord::Base
+ 
+   # Builds a record for the given row and returns it
+   # To be implemented by subclasses
+-  def build_object(row)
++  def build_object(row, item)
++  end
++
++  # Extends object with properties, that may only be handled after it's been
++  # persisted.
++  def extend_object(row, item, object)
+   end
+ 
+   # Generates a filename used to store the import file
+diff --git app/models/issue_import.rb b/app/models/issue_import.rb
+index 526ac6dea..5fe73f1a6 100644
+--- app/models/issue_import.rb
++++ b/app/models/issue_import.rb
+@@ -200,6 +200,119 @@ class IssueImport < Import
+     issue
+   end
+ 
++  def extend_object(row, item, issue)
++    build_relations(row, item, issue)
++  end
++
++  def build_relations(row, item, issue)
++    IssueRelation::TYPES.keys.each do |type|
++      has_delay = type == IssueRelation::TYPE_PRECEDES || type == IssueRelation::TYPE_FOLLOWS
++
++      if decls = relation_values(row, "relation_#{type}")
++        decls.each do |decl|
++          unless decl[:matches]
++            # Invalid relation syntax - doesn't match regexp
++            next
++          end
++
++          if decl[:delay] && !has_delay
++            # Invalid relation syntax - delay for relation that doesn't support delays
++            next
++          end
++
++          relation = IssueRelation.new(
++            "relation_type" => type,
++            "issue_from_id" => issue.id
++          )
++
++          if decl[:other_id]
++            relation.issue_to_id = decl[:other_id]
++          elsif decl[:other_pos]
++            if use_unique_id?
++              issue_id = items.where(:unique_id => decl[:other_pos]).first.try(:obj_id)
++              if issue_id
++                relation.issue_to_id = issue_id
++              else
++                add_callback(decl[:other_pos], 'set_relation', item.position, type, decl[:delay])
++                next
++              end
++            else
++              if decl[:other_pos] > item.position
++                add_callback(decl[:other_pos], 'set_relation', item.position, type, decl[:delay])
++                next
++              elsif issue_id = items.where(:position => decl[:other_pos]).first.try(:obj_id)
++                relation.issue_to_id = issue_id
++              end
++            end
++          end
++
++          relation.delay = decl[:delay] if decl[:delay]
++
++          relation.save!
++        end
++      end
++    end
++
++    issue
++  end
++
++  def relation_values(row, name)
++    content = row_value(row, name)
++
++    return if content.blank?
++
++    content.split(",").map do |declaration|
++      declaration = declaration.strip
++
++      # Valid expression:
++      #
++      # 123  => row 123 within the CSV
++      # #123 => issue with ID 123
++      #
++      # For precedes and follows
++      #
++      # 123 7d    => row 123 within CSV with 7 day delay
++      # #123  7d  => issue with ID 123 with 7 day delay
++      # 123 -3d   => negative delay allowed
++      #
++      #
++      # Invalid expression:
++      #
++      # No. 123 => Invalid leading letters
++      # # 123   => Invalid space between # and issue number
++      # 123 8h  => No other time units allowed (just days)
++      #
++      # Please note: If unique_id mapping is present, the whole line - but the
++      # trailing delay expression - is considered unique_id.
++      #
++      # See examples at Rubular http://rubular.com/r/mgXM5Rp6zK
++      #
++      match = declaration.match(/\A(?<unique_id>(?<is_id>#)?(?<id>\d+)|.+?)(?:\s+(?<delay>-?\d+)d)?\z/)
++
++      result = {
++        :matches     => false,
++        :declaration => declaration
++      }
++
++      if match
++        result[:matches] = true
++        result[:delay]   = match[:delay]
++
++        if match[:is_id] and match[:id]
++          result[:other_id] = match[:id]
++        elsif use_unique_id? and match[:unique_id]
++          result[:other_pos] = match[:unique_id]
++        elsif match[:id]
++          result[:other_pos] = match[:id].to_i
++        else
++          result[:matches] = false
++        end
++      end
++
++      result
++    end
++  end
++
+   # Callback that sets issue as the parent of a previously imported issue
+   def set_as_parent_callback(issue, child_position)
+     child_id = items.where(:position => child_position).first.try(:obj_id)
+@@ -212,4 +325,19 @@ class IssueImport < Import
+     child.save!
+     issue.reload
+   end
++
++  def set_relation_callback(to_issue, from_position, type, delay)
++    return if to_issue.new_record?
++
++    from_id = items.where(:position => from_position).first.try(:obj_id)
++    return unless from_id
++
++    IssueRelation.create!(
++      'relation_type' => type,
++      'issue_from_id' => from_id,
++      'issue_to_id'   => to_issue.id,
++      'delay'         => delay
++    )
++    to_issue.reload
++  end
+ end
+diff --git app/views/imports/_fields_mapping.html.erb b/app/views/imports/_fields_mapping.html.erb
+index a5c5cc5b8..cc35deef0 100644
+--- app/views/imports/_fields_mapping.html.erb
++++ b/app/views/imports/_fields_mapping.html.erb
+@@ -1,5 +1,3 @@
+-<div class="splitcontent">
+-<div class="splitcontentleft">
+ <p>
+   <label for="import_mapping_project_id"><%= l(:label_project) %></label>
+   <%= select_tag 'import_settings[mapping][project_id]',
+@@ -15,16 +13,6 @@
+   <label for="import_mapping_status"><%= l(:field_status) %></label>
+   <%= mapping_select_tag @import, 'status' %>
+ </p>
+-</div>
+-
+-<div class="splitcontentright">
+-<p></p>
+-<p>
+-  <label for="import_mapping_unique_id"><%= l(:field_unique_id) %></label>
+-  <%= mapping_select_tag @import, 'unique_id' %>
+-</p>
+-</div>
+-</div>
+ 
+ <div class="splitcontent">
+ <div class="splitcontentleft">
+@@ -64,12 +52,6 @@
+     </label>
+   <% end %>
+ </p>
+-<% @custom_fields.each do |field| %>
+-  <p>
+-    <label for="import_mapping_cf_<% field.id %>"><%= field.name %></label>
+-    <%= mapping_select_tag @import, "cf_#{field.id}" %>
+-  </p>
+-<% end %>
+ </div>
+ 
+ <div class="splitcontentright">
+@@ -77,10 +59,6 @@
+   <label for="import_mapping_is_private"><%= l(:field_is_private) %></label>
+   <%= mapping_select_tag @import, 'is_private' %>
+ </p>
+-<p>
+-  <label for="import_mapping_parent_issue_id"><%= l(:field_parent_issue) %></label>
+-  <%= mapping_select_tag @import, 'parent_issue_id' %>
+-</p>
+ <p>
+   <label for="import_mapping_start_date"><%= l(:field_start_date) %></label>
+   <%= mapping_select_tag @import, 'start_date' %>
+@@ -97,6 +75,12 @@
+   <label for="import_mapping_done_ratio"><%= l(:field_done_ratio) %></label>
+   <%= mapping_select_tag @import, 'done_ratio' %>
+ </p>
++<% @custom_fields.each do |field| %>
++  <p>
++    <label for="import_mapping_cf_<%= field.id %>"><%= field.name %></label>
++    <%= mapping_select_tag @import, "cf_#{field.id}" %>
++  </p>
++<% end %>
+ </div>
+ </div>
+ 
+diff --git app/views/imports/_relations_mapping.html.erb b/app/views/imports/_relations_mapping.html.erb
+new file mode 100644
+index 000000000..fa0b0950f
+--- /dev/null
++++ b/app/views/imports/_relations_mapping.html.erb
+@@ -0,0 +1,60 @@
++<div class="splitcontent">
++  <div class="splitcontentleft">
++    <p>
++      <label for="import_mapping_unique_id"><%= l(:field_unique_id) %></label>
++      <%= mapping_select_tag @import, 'unique_id' %>
++    </p>
++    <p>
++      <label for="import_settings_mapping_parent_issue_id"><%= l(:field_parent_issue) %></label>
++      <%= mapping_select_tag @import, 'parent_issue_id' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_duplicates"><%= l(:label_duplicates) %></label>
++      <%= mapping_select_tag @import, 'relation_duplicates' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_duplicated"><%= l(:label_duplicated_by) %></label>
++      <%= mapping_select_tag @import, 'relation_duplicated' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_blocks"><%= l(:label_blocks) %></label>
++      <%= mapping_select_tag @import, 'relation_blocks' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_blocked"><%= l(:label_blocked_by) %></label>
++      <%= mapping_select_tag @import, 'relation_blocked' %>
++    </p>
++  </div>
++
++  <div class="splitcontentright">
++    <p></p>
++    <p>
++      <label for="import_settings_mapping_relation_relates"><%= l(:label_relates_to) %></label>
++      <%= mapping_select_tag @import, 'relation_relates' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_precedes"><%= l(:label_precedes) %></label>
++      <%= mapping_select_tag @import, 'relation_precedes' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_follows"><%= l(:label_follows) %></label>
++      <%= mapping_select_tag @import, 'relation_follows' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_copied_to"><%= l(:label_copied_to) %></label>
++      <%= mapping_select_tag @import, 'relation_copied_to' %>
++    </p>
++
++    <p>
++      <label for="import_settings_mapping_relation_copied_from"><%= l(:label_copied_from) %></label>
++      <%= mapping_select_tag @import, 'relation_copied_from' %>
++    </p>
++  </div>
++</div>
+diff --git app/views/imports/mapping.html.erb b/app/views/imports/mapping.html.erb
+index 2e225d6c2..8a465891a 100644
+--- app/views/imports/mapping.html.erb
++++ b/app/views/imports/mapping.html.erb
+@@ -8,6 +8,13 @@
+     </div>
+   </fieldset>
+ 
++  <fieldset class="box tabular collapsible collapsed">
++    <legend onclick="toggleFieldset(this);"><%= l(:label_relations_mapping) %></legend>
++    <div id="relations-mapping" style="display: none;">
++      <%= render :partial => 'relations_mapping' %>
++    </div>
++  </fieldset>
++
+   <div class="autoscroll">
+   <fieldset class="box">
+     <legend><%= l(:label_file_content_preview) %></legend>
+diff --git config/locales/de.yml b/config/locales/de.yml
+index 47c70ef97..14cc45c96 100644
+--- config/locales/de.yml
++++ b/config/locales/de.yml
+@@ -1183,6 +1183,7 @@ de:
+   label_quote_char: Anführungszeichen
+   label_double_quote_char: Doppelte Anführungszeichen
+   label_fields_mapping: Zuordnung der Felder
++  label_relations_mapping: Zuordnung von Beziehungen
+   label_file_content_preview: Inhaltsvorschau
+   label_create_missing_values: Ergänze fehlende Werte
+   button_import: Importieren
+diff --git config/locales/en.yml b/config/locales/en.yml
+index 24c4608e2..5117e2b53 100644
+--- config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -1013,6 +1013,7 @@ en:
+   label_quote_char: Quote
+   label_double_quote_char: Double quote
+   label_fields_mapping: Fields mapping
++  label_relations_mapping: Relations mapping
+   label_file_content_preview: File content preview
+   label_create_missing_values: Create missing values
+   label_api: API
+diff --git test/fixtures/files/import_subtasks.csv b/test/fixtures/files/import_subtasks.csv
+index 1e789514e..d00ab6cc3 100644
+--- test/fixtures/files/import_subtasks.csv
++++ b/test/fixtures/files/import_subtasks.csv
+@@ -1,5 +1,5 @@
+-row;tracker;subject;parent
+-1;bug;Root;
+-2;bug;Child 1;1
+-3;bug;Grand-child;4
+-4;bug;Child 2;1
++row;tracker;subject;parent;simple relation;delayed relation
++1;bug;Root;;;
++2;bug;Child 1;1;1,4;1 2d
++3;bug;Grand-child;4;4;4 -1d
++4;bug;Child 2;1;1;1 1d
+diff --git test/fixtures/files/import_subtasks_with_relations.csv b/test/fixtures/files/import_subtasks_with_relations.csv
+new file mode 100644
+index 000000000..2f194cdbd
+--- /dev/null
++++ b/test/fixtures/files/import_subtasks_with_relations.csv
+@@ -0,0 +1,5 @@
++row;tracker;subject;start;due;parent;follows
++1;bug;2nd Child;2020-01-12;2020-01-20;3;2 1d
++2;bug;1st Child;2020-01-01;2020-01-10;3;
++3;bug;Parent;2020-01-01;2020-01-31;;
++1;bug;3rd Child;2020-01-22;2020-01-31;3;1 1d
+diff --git test/fixtures/files/import_subtasks_with_unique_id.csv b/test/fixtures/files/import_subtasks_with_unique_id.csv
+index bd01e7298..efd5d0d82 100644
+--- test/fixtures/files/import_subtasks_with_unique_id.csv
++++ b/test/fixtures/files/import_subtasks_with_unique_id.csv
+@@ -1,5 +1,10 @@
+-id;tracker;subject;parent
+-RED-I;bug;Root;
+-RED-II;bug;Child 1;RED-I
+-RED-III;bug;Grand-child;RED-IV
+-RED-IV;bug;Child 2;RED-I
++id;tracker;subject;parent;follows
++RED-IV;bug;Grand-child;RED-III;
++RED-III;bug;Child 2;RED-I;RED-II 1d
++RED-II;bug;Child 1;RED-I;
++RED-I;bug;Root;;
++BLUE-I;bug;Root;;
++BLUE-II;bug;Child 1;BLUE-I;
++BLUE-III;bug;Child 2;BLUE-I;BLUE-II 1d
++BLUE-IV;bug;Grand-child;BLUE-III;
++GREEN-II;bug;Thing;#1;#2 3d;
+diff --git test/unit/issue_import_test.rb b/test/unit/issue_import_test.rb
+index 8def18342..1f2ca4f71 100644
+--- test/unit/issue_import_test.rb
++++ b/test/unit/issue_import_test.rb
+@@ -128,14 +128,135 @@ class IssueImportTest < ActiveSupport::TestCase
+     assert_equal child2, grandchild.parent
+   end
+ 
+-  def test_backward_and_forward_reference_with_unique_id
++  def test_references_with_unique_id
+     import = generate_import_with_mapping('import_subtasks_with_unique_id.csv')
+-    import.settings['mapping'] = {'project_id' => '1', 'unique_id' => '0', 'tracker' => '1', 'subject' => '2', 'parent_issue_id' => '3'}
++    import.settings['mapping'] = {'project_id' => '1', 'unique_id' => '0', 'tracker' => '1', 'subject' => '2', 'parent_issue_id' => '3', 'relation_follows' => '4'}
+     import.save!
+ 
+-    root, child1, grandchild, child2 = new_records(Issue, 4) { import.run }
+-    assert_equal root, child1.parent
+-    assert_equal child2, grandchild.parent
++    red4, red3, red2, red1, blue1, blue2, blue3, blue4, green = new_records(Issue, 9) { import.run }
++
++    # future references
++    assert_equal red1, red2.parent
++    assert_equal red3, red4.parent
++
++    assert IssueRelation.where('issue_from_id' => red2.id, 'issue_to_id' => red3.id, 'delay' => 1, 'relation_type' => 'precedes').present?
++
++    # past references
++    assert_equal blue1, blue2.parent
++    assert_equal blue3, blue4.parent
++
++    assert IssueRelation.where('issue_from_id' => blue2.id, 'issue_to_id' => blue3.id, 'delay' => 1, 'relation_type' => 'precedes').present?
++
++    assert_equal issues(:issues_001), green.parent
++    assert IssueRelation.where('issue_from_id' => issues(:issues_002).id, 'issue_to_id' => green.id, 'delay' => 3, 'relation_type' => 'precedes').present?
++  end
++
++  def test_follow_relation
++    import = generate_import_with_mapping('import_subtasks.csv')
++    import.settings['mapping'] = {'project_id' => '1', 'tracker' => '1', 'subject' => '2', 'relation_relates' => '4'}
++    import.save!
++
++    one, one_one, one_two_one, one_two = new_records(Issue, 4) { import.run }
++    assert_equal 2, one.relations.count
++    assert one.relations.all? { |r| r.relation_type == 'relates' }
++    assert one.relations.any? { |r| r.other_issue(one) == one_one }
++    assert one.relations.any? { |r| r.other_issue(one) == one_two }
++
++    assert_equal 2, one_one.relations.count
++    assert one_one.relations.all? { |r| r.relation_type == 'relates' }
++    assert one_one.relations.any? { |r| r.other_issue(one_one) == one }
++    assert one_one.relations.any? { |r| r.other_issue(one_one) == one_two }
++
++    assert_equal 3, one_two.relations.count
++    assert one_two.relations.all? { |r| r.relation_type == 'relates' }
++    assert one_two.relations.any? { |r| r.other_issue(one_two) == one }
++    assert one_two.relations.any? { |r| r.other_issue(one_two) == one_one }
++    assert one_two.relations.any? { |r| r.other_issue(one_two) == one_two_one }
++
++    assert_equal 1, one_two_one.relations.count
++    assert one_two_one.relations.all? { |r| r.relation_type == 'relates' }
++    assert one_two_one.relations.any? { |r| r.other_issue(one_two_one) == one_two }
++  end
++
++  def test_delayed_relation
++    import = generate_import_with_mapping('import_subtasks.csv')
++    import.settings['mapping'] = {'project_id' => '1', 'tracker' => '1', 'subject' => '2', 'relation_precedes' => '5'}
++    import.save!
++
++    one, one_one, one_two_one, one_two = new_records(Issue, 4) { import.run }
++
++    assert_equal 2, one.relations_to.count
++    assert one.relations_to.all? { |r| r.relation_type == 'precedes' }
++    assert one.relations_to.any? { |r| r.issue_from == one_one && r.delay == 2 }
++    assert one.relations_to.any? { |r| r.issue_from == one_two && r.delay == 1 }
++
++
++    assert_equal 1, one_one.relations_from.count
++    assert one_one.relations_from.all? { |r| r.relation_type == 'precedes' }
++    assert one_one.relations_from.any? { |r| r.issue_to == one && r.delay == 2 }
++
++
++    assert_equal 1, one_two.relations_to.count
++    assert one_two.relations_to.all? { |r| r.relation_type == 'precedes' }
++    assert one_two.relations_to.any? { |r| r.issue_from == one_two_one && r.delay == -1 }
++
++    assert_equal 1, one_two.relations_from.count
++    assert one_two.relations_from.all? { |r| r.relation_type == 'precedes' }
++    assert one_two.relations_from.any? { |r| r.issue_to == one && r.delay == 1 }
++
++
++    assert_equal 1, one_two_one.relations_from.count
++    assert one_two_one.relations_from.all? { |r| r.relation_type == 'precedes' }
++    assert one_two_one.relations_from.any? { |r| r.issue_to == one_two && r.delay == -1 }
++  end
++
++  def test_parent_and_follows_relation
++    import = generate_import_with_mapping('import_subtasks_with_relations.csv')
++    import.settings['mapping'] = {
++      'project_id'       => '1',
++      'tracker'          => '1',
++
++      'subject'          => '2',
++      'start_date'       => '3',
++      'due_date'         => '4',
++      'parent_issue_id'  => '5',
++      'relation_follows' => '6'
++    }
++    import.save!
++
++    second, first, parent, third = assert_difference('IssueRelation.count', 2) { new_records(Issue, 4) { import.run } }
++
++    # Parent relations
++    assert_equal parent, first.parent
++    assert_equal parent, second.parent
++    assert_equal parent, third.parent
++
++    # Issue relations
++    assert IssueRelation.where(
++      :issue_from_id => first.id,
++      :issue_to_id   => second.id,
++      :relation_type => 'precedes',
++      :delay         => 1).present?
++
++    assert IssueRelation.where(
++      :issue_from_id => second.id,
++      :issue_to_id   => third.id,
++      :relation_type => 'precedes',
++      :delay         => 1).present?
++
++
++    # Checking dates, because they might act weird, when relations are added
++    assert_equal Date.new(2020, 1,  1), parent.start_date
++    assert_equal Date.new(2020, 1, 31), parent.due_date
++
++    assert_equal Date.new(2020, 1,  1), first.start_date
++    assert_equal Date.new(2020, 1, 10), first.due_date
++
++    assert_equal Date.new(2020, 1, 12), second.start_date
++    assert_equal Date.new(2020, 1, 20), second.due_date
++
++    assert_equal Date.new(2020, 1, 22), third.start_date
++    assert_equal Date.new(2020, 1, 31), third.due_date
+   end
+ 
+   def test_assignee_should_be_set
+-- 
+2.14.1
+
